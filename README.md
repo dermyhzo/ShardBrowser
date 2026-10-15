@@ -93,6 +93,13 @@ Configuration details are available in [Usage](#usage).
 >   Drive folder, a mounted SMB share or Google Drive for desktop. Per profile
 >   or all at once; running profiles are refused so Chromium's databases are
 >   never copied mid-write.
+> * **Auto sync, cloud-browser style:** switch it on for one folder and every
+>   machine pointed at it behaves like AdsPower's cloud profiles. Start pulls
+>   the newest copy and locks the profile (another machine trying to open it
+>   is refused, with a Take over for a machine that died holding it); closing
+>   the browser uploads it and releases the lock. Start waits for another
+>   machine's upload still in flight. New profiles and deletions spread to
+>   every machine within a minute (deletions land in the local trash).
 > * **MCP sync tools:** `sync_status`, `sync_set_target`, `sync_push`,
 >   `sync_pull` (see [mcp/README.md](mcp/README.md)), sharing the same
 >   `sync.json` as the panel. The MCP server now mints its own API token from

@@ -109,6 +109,37 @@ async fn cloud_sync_pull(target: String, ids: Option<Vec<String>>) -> Result<clo
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn cloud_sync_auto_status() -> Result<cloud_sync::AutoStatus, String> {
+    tauri::async_runtime::spawn_blocking(cloud_sync::auto_status).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cloud_sync_set_auto(target: Option<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        cloud_sync::set_auto(target.as_deref())?;
+        if target.is_some() {
+            std::thread::spawn(|| {
+                if let Err(e) = cloud_sync::reconcile() {
+                    eprintln!("[sync] reconcile: {e}");
+                }
+            });
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cloud_sync_take_over(id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || cloud_sync::take_over(&id))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
 // ---- Profiles ----
 
 #[tauri::command]
@@ -2209,6 +2240,9 @@ pub fn run() {
             cloud_sync_set_target,
             cloud_sync_push,
             cloud_sync_pull,
+            cloud_sync_auto_status,
+            cloud_sync_set_auto,
+            cloud_sync_take_over,
             data_root_migrate,
             profile_bind_proxy,
             profile_clone,
@@ -2281,6 +2315,7 @@ pub fn run() {
         ])
         .setup(|app| {
             let _ = APP_HANDLE.set(app.handle().clone());
+            cloud_sync::spawn_reconciler();
 
             {
                 use tauri::menu::{Menu, MenuItem};

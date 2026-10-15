@@ -238,6 +238,20 @@ server.tool(
   async ({ target, profile_id }) => text(sync.pull(target, profile_id)),
 );
 
+server.tool(
+  "sync_set_auto",
+  "Turn auto sync on for a target (nas or gdrive) or off (empty). With it on, the launcher pulls a profile's newest copy on Start, locks it so other machines cannot open it, and pushes it back when the browser closes; new and deleted profiles spread to the other machines.",
+  { target: z.enum(["nas", "gdrive", ""]) },
+  async ({ target }) => text(sync.setAuto(target)),
+);
+
+server.tool(
+  "sync_take_over",
+  "Release another machine's lock on a profile, for when that machine is off or crashed while the profile was open. Only do this when the user confirms the other machine is not using it.",
+  { profile_id: z.string().regex(/^[0-9a-f-]{36}$/i, "a profile uuid") },
+  async ({ profile_id }) => text(sync.takeOver(profile_id)),
+);
+
 // ================= API tools =================
 
 server.tool(

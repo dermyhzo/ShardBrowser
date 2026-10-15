@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Settings, ApiInfo, DataRootInfo, CloudSyncTarget, CloudSyncResult } from "./types";
+import type { Settings, ApiInfo, DataRootInfo, CloudSyncTarget, CloudSyncResult, CloudSyncAuto } from "./types";
 
 export const settingsGet = () => invoke<Settings>("settings_get");
 export const settingsSave = (value: Settings) => invoke("settings_save", { value });
@@ -21,3 +21,8 @@ export const cloudSyncPush = (target: string, ids?: string[]) =>
   invoke<CloudSyncResult>("cloud_sync_push", { target, ids });
 export const cloudSyncPull = (target: string, ids?: string[]) =>
   invoke<CloudSyncResult>("cloud_sync_pull", { target, ids });
+export const cloudSyncAutoStatus = () => invoke<CloudSyncAuto>("cloud_sync_auto_status");
+/** null turns auto sync off. */
+export const cloudSyncSetAuto = (target: string | null) => invoke("cloud_sync_set_auto", { target });
+/** Drop another machine's lock on a profile (that machine died with it open). */
+export const cloudSyncTakeOver = (id: string) => invoke("cloud_sync_take_over", { id });

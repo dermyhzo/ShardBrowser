@@ -285,6 +285,8 @@ pub struct SyncResult {
     pub dir: String,
     pub profiles: usize,
     pub files_copied: u64,
+    /// Left alone because another machine has them open.
+    pub skipped: Vec<String>,
 }
 
 /// Never deletes a profile from the backup: a full push from a fresh machine
@@ -300,8 +302,19 @@ pub fn push(name: &str, ids: Option<Vec<String>>) -> Result<SyncResult> {
     let dst = resolve(name, false)?;
     let root = store::data_root()?;
     let mut copied = 0;
+    let mut skipped = Vec::new();
     for id in &ids {
-        copied += copy_profile(&root, &dst, id)?;
+        // Open elsewhere, or changed elsewhere since this machine last synced:
+        // their copy is newer. Only an explicit one-profile backup overrides.
+        let ahead = full && remote_ahead(&dst, id, remote_state(&dst, id).as_ref(), &get_local(&dst, id));
+        if let (false, Some(l)) = (full, foreign_lock(&dst, id)) {
+            bail!("This profile is open on {}. Back it up there, or close it first.", l.host);
+        }
+        if foreign_lock(&dst, id).is_some() || ahead {
+            skipped.push(id.clone());
+            continue;
+        }
+        copied += publish(&dst, id)?;
     }
     if full {
         if root.join("extensions").is_dir() {
@@ -315,7 +328,7 @@ pub fn push(name: &str, ids: Option<Vec<String>>) -> Result<SyncResult> {
         "profile": if full { "all".to_string() } else { ids.join(",") },
     });
     fs::write(dst.join("LAST_PUSH.json"), stamp.to_string())?;
-    Ok(SyncResult { target: name.into(), dir: dst.display().to_string(), profiles: ids.len(), files_copied: copied })
+    Ok(SyncResult { target: name.into(), dir: dst.display().to_string(), profiles: ids.len() - skipped.len(), files_copied: copied, skipped })
 }
 
 /// Replaces each restored profile wholesale and keeps profiles that exist only
@@ -328,8 +341,20 @@ pub fn pull(name: &str, ids: Option<Vec<String>>) -> Result<SyncResult> {
     guard(&ids)?;
     let root = store::data_root()?;
     let mut copied = 0;
+    let mut skipped = Vec::new();
     for id in &ids {
-        copied += copy_profile(&src, &root, id)?;
+        // Open elsewhere, or still uploading: restoring now would take a copy
+        // that is about to change, and record it as in sync.
+        let incomplete = state_unreadable(&src, id)
+            || remote_state(&src, id).is_some_and(|st| !arrived(&src, id, &st, &mut Default::default()));
+        if foreign_lock(&src, id).is_some() || incomplete {
+            if !full {
+                bail!("This profile is open on another machine or still uploading. Try again once it is closed there.");
+            }
+            skipped.push(id.clone());
+            continue;
+        }
+        copied += adopt(&src, id)?;
     }
     if full {
         if src.join("extensions").is_dir() {
@@ -337,7 +362,7 @@ pub fn pull(name: &str, ids: Option<Vec<String>>) -> Result<SyncResult> {
         }
         copy_files(&src.join("config"), &store::config_root()?, CONFIG_FILES)?;
     }
-    Ok(SyncResult { target: name.into(), dir: src.display().to_string(), profiles: ids.len(), files_copied: copied })
+    Ok(SyncResult { target: name.into(), dir: src.display().to_string(), profiles: ids.len() - skipped.len(), files_copied: copied, skipped })
 }
 
 /// Config files travel whole, so two rules keep one side from erasing the
@@ -508,6 +533,735 @@ fn chrono_now() -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
+
+// ================= Auto sync (open = pull, close = push) =================
+//
+// The AdsPower model on a shared folder: Start pulls the newest copy and takes
+// a lock in the folder; closing the browser pushes it back and releases the
+// lock. A second machine meets the lock and is refused, because one profile
+// open on two machines at once is two writers on one cookie database.
+//
+// In the target folder, beside profiles/ and user-data/:
+//   state/<id>.json  {rev, machine, host, at, files: {path: size}}, written
+//                    last, so a reader can tell an upload still in flight
+//                    (files missing or short) from a finished one.
+//   locks/<id>.json  {machine, host, at}; `at` is refreshed while it runs, and
+//                    a lock nobody refreshed for LOCK_STALE_SECS is abandoned.
+// Locally, sync-state.json keeps the rev each profile was last synced at.
+
+use serde::Deserialize;
+
+const LOCK_STALE_SECS: u64 = 10 * 60;
+const HEARTBEAT_SECS: u64 = 2 * 60;
+/// How long Start waits for another machine's upload to arrive in full.
+const UPLOAD_WAIT_SECS: u64 = 120;
+/// How long Start waits for a state file that trails its profile's files.
+const STATE_GRACE_SECS: u64 = if cfg!(test) { 0 } else { 20 };
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct RemoteState {
+    pub rev: u64,
+    pub machine: String,
+    pub host: String,
+    pub at: u64,
+    #[serde(default)]
+    pub files: BTreeMap<String, FileSig>,
+}
+
+/// One file of an upload. Old states carry the size alone; new ones add a
+/// SHA-256, because a SQLite file often keeps its size across writes and the
+/// size alone cannot tell a finished upload from a stale copy.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum FileSig {
+    Full { size: u64, sha256: String },
+    Size(u64),
+}
+
+fn sha256_file(p: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut f = fs::File::open(p).ok()?;
+    let mut h = Sha256::new();
+    std::io::copy(&mut f, &mut h).ok()?;
+    Some(format!("{:x}", h.finalize()))
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Lock {
+    pub machine: String,
+    pub host: String,
+    pub at: u64,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct LocalEntry {
+    rev: u64,
+    /// Ran here and the push afterwards did not happen.
+    dirty: bool,
+    /// Fingerprint of the local user-data right after the last sync in this
+    /// folder. Different now = changed here since (with auto sync off, too).
+    /// Empty = never synced with this folder.
+    #[serde(default)]
+    fp: String,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Stable id for this machine; hostnames repeat ("MacBook-Pro.local").
+fn machine_id() -> String {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let p = store::config_root().map(|r| r.join("machine-id"));
+        if let Ok(p) = &p {
+            if let Ok(s) = fs::read_to_string(p) {
+                if !s.trim().is_empty() {
+                    return s.trim().to_string();
+                }
+            }
+            let id = uuid::Uuid::new_v4().to_string();
+            let _ = fs::write(p, &id);
+            return id;
+        }
+        hostname()
+    })
+    .clone()
+}
+
+pub fn auto_target() -> Option<String> {
+    read_conf().get("auto").filter(|t| TARGETS.contains(&t.as_str())).cloned()
+}
+
+pub fn set_auto(target: Option<&str>) -> Result<()> {
+    let mut c = read_conf();
+    match target {
+        Some(t) if TARGETS.contains(&t) => {
+            c.insert("auto".into(), t.into());
+        }
+        Some(t) => bail!("unknown target {t}"),
+        None => {
+            c.remove("auto");
+        }
+    }
+    fs::write(conf_path()?, serde_json::to_string_pretty(&c)?)?;
+    Ok(())
+}
+
+fn local_state_path() -> Result<PathBuf> {
+    Ok(store::config_root()?.join("sync-state.json"))
+}
+
+/// Keyed by folder, then profile: a rev only means something in the folder it
+/// came from, so switching folders must not make a stale copy look current.
+type LocalStates = BTreeMap<String, BTreeMap<String, LocalEntry>>;
+
+fn local_states() -> LocalStates {
+    local_state_path()
+        .ok()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn get_local(dir: &Path, id: &str) -> LocalEntry {
+    local_states()
+        .get(&dir.display().to_string())
+        .and_then(|m| m.get(id))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn set_local(dir: &Path, id: &str, e: LocalEntry) -> Result<()> {
+    // One writer at a time: exits of several profiles can land together.
+    static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = M.lock().unwrap_or_else(|e| e.into_inner());
+    let mut all = local_states();
+    all.entry(dir.display().to_string()).or_default().insert(id.into(), e);
+    write_json(&local_state_path()?, &all)
+}
+
+/// Start, close and the reconciler never work on the same profile at once.
+fn profile_guard(id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static MAP: OnceLock<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let map = MAP.get_or_init(Default::default);
+    map.lock().unwrap_or_else(|e| e.into_inner()).entry(id.into()).or_default().clone()
+}
+
+/// Per-profile stop switch for the heartbeat thread.
+fn heartbeat_flag(id: &str, fresh: bool) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    use std::sync::{atomic::AtomicBool, Arc, Mutex, OnceLock};
+    static MAP: OnceLock<Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+    let mut m = MAP.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if fresh {
+        let f = Arc::new(AtomicBool::new(false));
+        m.insert(id.into(), f.clone());
+        f
+    } else {
+        m.entry(id.into()).or_default().clone()
+    }
+}
+
+fn stop_heartbeat(id: &str) {
+    heartbeat_flag(id, false).store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(p: &Path) -> Option<T> {
+    serde_json::from_str(&fs::read_to_string(p).ok()?).ok()
+}
+
+/// Written to a temp name and renamed, so a sync client never uploads half a file.
+fn write_json<T: Serialize>(p: &Path, v: &T) -> Result<()> {
+    if let Some(d) = p.parent() {
+        fs::create_dir_all(d)?;
+    }
+    let tmp = p.with_extension("json.part");
+    fs::write(&tmp, serde_json::to_vec_pretty(v)?)?;
+    fs::rename(&tmp, p)?;
+    Ok(())
+}
+
+pub fn remote_state(dir: &Path, id: &str) -> Option<RemoteState> {
+    read_json(&dir.join("state").join(format!("{id}.json")))
+}
+
+/// A state file that is there but does not parse: still downloading, a Drive
+/// conflict copy, or damaged. Never read as "no state".
+fn state_unreadable(dir: &Path, id: &str) -> bool {
+    dir.join("state").join(format!("{id}.json")).exists() && remote_state(dir, id).is_none()
+}
+
+pub fn remote_lock(dir: &Path, id: &str) -> Option<Lock> {
+    read_json(&dir.join("locks").join(format!("{id}.json")))
+}
+
+/// A lock held by another machine that is still being refreshed.
+fn foreign_lock(dir: &Path, id: &str) -> Option<Lock> {
+    remote_lock(dir, id).filter(|l| l.machine != machine_id() && unix_now().saturating_sub(l.at) < LOCK_STALE_SECS)
+}
+
+fn take_lock(dir: &Path, id: &str) -> Result<()> {
+    write_json(
+        &dir.join("locks").join(format!("{id}.json")),
+        &Lock { machine: machine_id(), host: hostname(), at: unix_now() },
+    )
+}
+
+fn release_lock(dir: &Path, id: &str) {
+    let p = dir.join("locks").join(format!("{id}.json"));
+    if remote_lock(dir, id).is_some_and(|l| l.machine == machine_id()) {
+        let _ = fs::remove_file(p);
+    }
+}
+
+/// Drop another machine's lock: for when that machine died with it held.
+pub fn take_over(id: &str) -> Result<()> {
+    check_ids(&[id.to_string()])?;
+    let t = auto_target().context("auto sync is off")?;
+    let dir = resolve(&t, true)?;
+    let _ = fs::remove_file(dir.join("locks").join(format!("{id}.json")));
+    Ok(())
+}
+
+/// Every file a pull would copy: relative path -> (size, mtime secs).
+fn scan(dir: &Path) -> BTreeMap<String, (u64, u64)> {
+    fn walk(base: &Path, d: &Path, out: &mut BTreeMap<String, (u64, u64)>) {
+        let Ok(rd) = fs::read_dir(d) else { return };
+        for e in rd.flatten() {
+            if skip(&e.file_name().to_string_lossy()) {
+                continue;
+            }
+            let p = e.path();
+            match e.file_type() {
+                Ok(t) if t.is_dir() => walk(base, &p, out),
+                Ok(t) if t.is_file() => {
+                    if let (Ok(rel), Ok(m)) = (p.strip_prefix(base), e.metadata()) {
+                        let mt = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+                        out.insert(rel.to_string_lossy().replace('\\', "/"), (m.len(), mt));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+fn manifest(dir: &Path) -> BTreeMap<String, FileSig> {
+    scan(dir)
+        .into_iter()
+        .filter_map(|(k, (size, _))| Some((k.clone(), FileSig::Full { size, sha256: sha256_file(&dir.join(&k))? })))
+        .collect()
+}
+
+/// FNV-1a over "path\0size\0mtime\n" lines; mcp/sync.js computes the same.
+fn fingerprint(dir: &Path) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for (k, (len, mt)) in scan(dir) {
+        for b in format!("{k}\0{len}\0{mt}\n").bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("{h:016x}")
+}
+
+fn has_files(dir: &Path) -> bool {
+    !scan(dir).is_empty()
+}
+
+/// The upload described by `st` has fully arrived in `dir`: every file there
+/// with its size and, when the state carries one, its content hash. `ok`
+/// remembers files already verified, so a wait loop hashes each file once.
+fn arrived(dir: &Path, id: &str, st: &RemoteState, ok: &mut std::collections::HashSet<String>) -> bool {
+    let ud = dir.join("user-data").join(id);
+    if !dir.join("profiles").join(format!("{id}.json")).is_file() {
+        return false;
+    }
+    // Files the upload did not list (a deletion not yet propagated, a stale
+    // -journal) would be mirrored in beside the new database.
+    if st.files.values().any(|f| matches!(f, FileSig::Full { .. }))
+        && scan(&ud).iter().any(|(rel, (size, _))| *size > 0 && !st.files.contains_key(rel))
+    {
+        return false;
+    }
+    for (rel, sig) in &st.files {
+        if ok.contains(rel) {
+            continue;
+        }
+        let p = ud.join(rel);
+        let good = match sig {
+            FileSig::Size(size) => fs::metadata(&p).is_ok_and(|m| m.len() == *size),
+            FileSig::Full { size, sha256 } => {
+                fs::metadata(&p).is_ok_and(|m| m.len() == *size) && sha256_file(&p).as_deref() == Some(sha256.as_str())
+            }
+        };
+        if !good {
+            return false;
+        }
+        ok.insert(rel.clone());
+    }
+    true
+}
+
+/// Push one profile and record it as the newest revision.
+fn publish(dir: &Path, id: &str) -> Result<u64> {
+    let root = store::data_root()?;
+    let ud = root.join("user-data").join(id);
+    let copied = copy_profile(&root, dir, id)?;
+    let rev = remote_state(dir, id).map(|r| r.rev).unwrap_or(0).max(get_local(dir, id).rev) + 1;
+    write_json(
+        &dir.join("state").join(format!("{id}.json")),
+        &RemoteState { rev, machine: machine_id(), host: hostname(), at: unix_now(), files: manifest(&ud) },
+    )?;
+    set_local(dir, id, LocalEntry { rev, dirty: false, fp: fingerprint(&ud) })?;
+    Ok(copied)
+}
+
+/// Pull one profile and remember the revision it came at.
+fn adopt(dir: &Path, id: &str) -> Result<u64> {
+    let root = store::data_root()?;
+    let n = copy_profile(dir, &root, id)?;
+    let rev = remote_state(dir, id).map(|r| r.rev).unwrap_or(0);
+    set_local(dir, id, LocalEntry { rev, dirty: false, fp: fingerprint(&root.join("user-data").join(id)) })?;
+    Ok(n)
+}
+
+/// Remote is ahead of what this machine last synced. An old-style copy (no
+/// state file) that this machine never synced counts as ahead, unless it is
+/// byte-for-byte what is here, in which case the two are adopted as in sync.
+fn remote_ahead(dir: &Path, id: &str, st: Option<&RemoteState>, local: &LocalEntry) -> bool {
+    if st.is_none() && state_unreadable(dir, id) {
+        return true;
+    }
+    match st {
+        Some(r) => r.rev > local.rev,
+        None => {
+            let rud = dir.join("user-data").join(id);
+            if !has_files(&rud) || !local.fp.is_empty() {
+                return false;
+            }
+            let lud = store::data_root().map(|r| r.join("user-data").join(id)).unwrap_or_default();
+            let same = has_files(&lud) && fingerprint(&lud) == fingerprint(&rud);
+            if same {
+                let _ = set_local(dir, id, LocalEntry { rev: 0, dirty: false, fp: fingerprint(&lud) });
+            }
+            !same
+        }
+    }
+}
+
+fn conflict(host: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "This profile changed both here and on {host}. Nothing was overwritten. In Settings, Sync pick Restore on it to take the other copy, or back it up to keep this one."
+    )
+}
+
+fn is_temporary(id: &str) -> bool {
+    crate::profile::load_raw(id).map(|s| s.meta.temporary).unwrap_or(false)
+}
+
+/// Runs before every launch. Ok means: go ahead with whatever is local now.
+pub fn before_launch(id: &str) -> Result<()> {
+    let Some(target) = auto_target() else { return Ok(()) };
+    if !valid_id(id) || is_temporary(id) {
+        return Ok(());
+    }
+    let dir = match resolve(&target, false) {
+        Ok(d) => d,
+        Err(e) => {
+            crate::notify_warning(format!(
+                "Auto sync skipped for this launch, the sync folder is unreachable ({e}). The copy on this machine is used and checked against the folder when you close it."
+            ));
+            return Ok(());
+        }
+    };
+    let guard = profile_guard(id);
+    let _g = guard.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(l) = foreign_lock(&dir, id) {
+        bail!(
+            "This profile is open on {} (last seen {} min ago). Close it there first, or if that machine is off, use Take over in Settings, Sync.",
+            l.host,
+            unix_now().saturating_sub(l.at) / 60
+        );
+    }
+    if pending().get(id).is_some_and(|op| op == "unforget") {
+        // Restored here while the folder was away: lift the tombstone now.
+        let _ = fs::remove_dir_all(dir.join("trash").join(id));
+        set_pending(id, None);
+    }
+    if dir.join("trash").join(id).exists() {
+        bail!("This profile was deleted on another machine. Restore it from the Trash there, or delete it here too.");
+    }
+    let local = get_local(&dir, id);
+    let lud = store::data_root()?.join("user-data").join(id);
+    let rud = dir.join("user-data").join(id);
+    let local_changed = has_files(&lud) && (local.dirty || local.fp != fingerprint(&lud));
+    let mut st = remote_state(&dir, id);
+    // A copy with no state file is an old-style backup, or Drive delivered the
+    // files before state/<id>.json: give the state a moment to land.
+    if st.is_none() && has_files(&rud) && local.fp.is_empty() {
+        let t0 = std::time::Instant::now();
+        while st.is_none() && t0.elapsed().as_secs() < STATE_GRACE_SECS {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            st = remote_state(&dir, id);
+        }
+    }
+    if st.is_none() && state_unreadable(&dir, id) {
+        bail!("The sync folder's record of this profile is still downloading or damaged. Try again in a minute.");
+    }
+    let remote_newer = remote_ahead(&dir, id, st.as_ref(), &local);
+    if remote_newer {
+        let host = st.as_ref().map(|r| r.host.clone()).unwrap_or_else(|| "another machine".into());
+        if local_changed {
+            return Err(conflict(&host));
+        }
+        if let Some(r) = &st {
+            let waited = std::time::Instant::now();
+            let mut told = false;
+            let mut verified = std::collections::HashSet::new();
+            while !arrived(&dir, id, r, &mut verified) {
+                if !told {
+                    crate::notify_warning(format!("Waiting for the copy from {} to finish uploading before the profile opens.", r.host));
+                    told = true;
+                }
+                if waited.elapsed().as_secs() >= UPLOAD_WAIT_SECS {
+                    bail!("The copy from {} is still uploading. Try again in a minute.", r.host);
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+        adopt(&dir, id)?;
+        eprintln!("[sync] pulled {id} from {host}");
+    }
+    take_lock(&dir, id)?;
+    // Heartbeat: keeps the lock fresh while the browser runs; after_exit and
+    // abort_launch flip the flag before they release, so it cannot come back.
+    let stop = heartbeat_flag(id, true);
+    let id = id.to_string();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(HEARTBEAT_SECS));
+        if stop.load(std::sync::atomic::Ordering::SeqCst) || !crate::process::Tracker::shared().is_running(&id) {
+            break;
+        }
+        if remote_lock(&dir, &id).is_some_and(|l| l.machine == machine_id()) {
+            let _ = take_lock(&dir, &id);
+        }
+    });
+    Ok(())
+}
+
+/// The launch failed after before_launch took the lock: give it back.
+pub fn abort_launch(id: &str) {
+    stop_heartbeat(id);
+    if let Some(dir) = auto_target().and_then(|t| resolve(&t, false).ok()) {
+        release_lock(&dir, id);
+    }
+}
+
+/// Runs after the browser exits: push, then let other machines have it.
+pub fn after_exit(id: &str) {
+    let Some(target) = auto_target() else { return };
+    if !valid_id(id) {
+        return;
+    }
+    let guard = profile_guard(id);
+    let _g = guard.lock().unwrap_or_else(|e| e.into_inner());
+    // Restarted already (automation, API): the new session owns lock and heartbeat.
+    if crate::process::Tracker::shared().is_running(id) || lock_alive(id) {
+        return;
+    }
+    stop_heartbeat(id);
+    let Some(key) = target_dir(&target) else { return };
+    let mut e = get_local(&key, id);
+    e.dirty = true;
+    if let Err(err) = set_local(&key, id, e.clone()) {
+        eprintln!("[sync] could not mark {id} dirty: {err}");
+    }
+    let res = (|| -> Result<()> {
+        let dir = resolve(&target, false)?;
+        if let Some(l) = foreign_lock(&dir, id) {
+            bail!("{} took this profile over while it was open here, so the copy here was kept and not uploaded. In Settings, Sync choose which copy to keep.", l.host);
+        }
+        if let Some(r) = remote_state(&dir, id).filter(|r| r.rev > e.rev) {
+            release_lock(&dir, id);
+            return Err(conflict(&r.host));
+        }
+        // An old-style copy this machine never synced with: not ours to replace.
+        if remote_state(&dir, id).is_none() && remote_ahead(&dir, id, None, &e) {
+            release_lock(&dir, id);
+            return Err(conflict("another machine"));
+        }
+        let pushed = publish(&dir, id);
+        release_lock(&dir, id);
+        pushed.map(|_| ()).context("the copy in the sync folder may be incomplete until the next successful close")
+    })();
+    match res {
+        Ok(()) => crate::notify_store_changed("profiles"),
+        Err(err) => crate::notify_warning(format!("Auto sync did not upload the profile you just closed: {err}")),
+    }
+}
+
+/// Refuses to delete a profile another machine has open right now.
+pub fn check_can_forget(id: &str) -> Result<()> {
+    let Some(t) = auto_target() else { return Ok(()) };
+    let Ok(dir) = resolve(&t, false) else { return Ok(()) };
+    if let Some(l) = foreign_lock(&dir, id) {
+        bail!("This profile is open on {}. Close it there before deleting it.", l.host);
+    }
+    Ok(())
+}
+
+fn pending_path() -> Result<PathBuf> {
+    Ok(store::config_root()?.join("sync-pending.json"))
+}
+
+/// Deletes and restores made while the folder was unreachable, applied by the
+/// next reconcile: id -> "forget" | "unforget".
+fn pending() -> BTreeMap<String, String> {
+    pending_path().ok().and_then(|p| read_json(&p)).unwrap_or_default()
+}
+
+fn set_pending(id: &str, op: Option<&str>) {
+    static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = M.lock().unwrap_or_else(|e| e.into_inner());
+    let mut m = pending();
+    match op {
+        Some(o) => {
+            m.insert(id.into(), o.into());
+        }
+        None => {
+            m.remove(id);
+        }
+    }
+    if let Ok(p) = pending_path() {
+        let _ = write_json(&p, &m);
+    }
+}
+
+fn bury(dir: &Path, id: &str) {
+    let grave = dir.join("trash").join(id);
+    let _ = fs::create_dir_all(&grave);
+    for (from, name) in [
+        (dir.join("profiles").join(format!("{id}.json")), format!("{id}.json")),
+        (dir.join("user-data").join(id), "user-data".to_string()),
+        (dir.join("state").join(format!("{id}.json")), "state.json".to_string()),
+    ] {
+        if from.exists() {
+            let to = grave.join(name);
+            let _ = if to.is_dir() { fs::remove_dir_all(&to) } else { fs::remove_file(&to) };
+            let _ = fs::rename(&from, &to);
+        }
+    }
+    let _ = write_json(&grave.join("deleted.json"), &serde_json::json!({ "at": unix_now(), "host": hostname(), "machine": machine_id() }));
+    release_lock(dir, id);
+}
+
+/// Deleting a profile here deletes it everywhere: its files move to the
+/// folder's trash/<id>/, which other machines read as "move yours to the
+/// trash". Queued when the folder is unreachable.
+pub fn forget(id: &str) {
+    if auto_target().is_none() || !valid_id(id) {
+        set_pending(id, None);
+        return;
+    }
+    match auto_target().and_then(|t| resolve(&t, false).ok()) {
+        Some(dir) => {
+            bury(&dir, id);
+            set_pending(id, None);
+        }
+        None => set_pending(id, Some("forget")),
+    }
+}
+
+/// Restored from the local trash: lift the tombstone so it syncs again.
+pub fn unforget(id: &str) {
+    if auto_target().is_none() || !valid_id(id) {
+        set_pending(id, None);
+        return;
+    }
+    match auto_target().and_then(|t| resolve(&t, false).ok()) {
+        Some(dir) => {
+            let _ = fs::remove_dir_all(dir.join("trash").join(id));
+            set_pending(id, None);
+        }
+        None => set_pending(id, Some("unforget")),
+    }
+}
+
+
+/// New profiles made on one machine appear on the others, new local ones are
+/// published, and a profile deleted elsewhere goes to the local trash. One
+/// profile's failure is logged and the rest carry on.
+pub fn reconcile() -> Result<usize> {
+    let Some(target) = auto_target() else { return Ok(0) };
+    let dir = resolve(&target, false)?;
+    let root = store::data_root()?;
+    let local: std::collections::HashSet<String> =
+        crate::profile::list_all()?.into_iter().map(|p| p.id).collect();
+    let trashed: std::collections::HashSet<String> =
+        crate::trash::list().map(|v| v.into_iter().map(|t| t.id).collect()).unwrap_or_default();
+    let mut changed = 0;
+    let queued = pending();
+    for (id, op) in &queued {
+        if op == "forget" {
+            if local.contains(id) {
+                // Restored here since; nothing to delete.
+            } else if foreign_lock(&dir, id).is_some() {
+                continue; // open elsewhere: try again on a later pass
+            } else {
+                bury(&dir, id);
+            }
+        } else {
+            let _ = fs::remove_dir_all(dir.join("trash").join(id));
+        }
+        set_pending(id, None);
+    }
+    // Tombstones only need to outlive every machine's 7-day local trash.
+    if let Ok(rd) = fs::read_dir(dir.join("trash")) {
+        for e in rd.flatten() {
+            let at = read_json::<serde_json::Value>(&e.path().join("deleted.json")).and_then(|v| v["at"].as_u64());
+            if at.is_some_and(|at| unix_now().saturating_sub(at) > 30 * 86400) {
+                let _ = fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    for id in remote_ids(&dir) {
+        if local.contains(&id) || trashed.contains(&id) || queued.contains_key(&id) {
+            continue;
+        }
+        // JSON only: the user-data follows on the first Start.
+        let r = fs::create_dir_all(root.join("profiles")).and_then(|_| {
+            fs::copy(dir.join("profiles").join(format!("{id}.json")), root.join("profiles").join(format!("{id}.json")))
+        });
+        match r {
+            Ok(_) => changed += 1,
+            Err(e) => eprintln!("[sync] adopt {id}: {e}"),
+        }
+    }
+    for id in &local {
+        if dir.join("profiles").join(format!("{id}.json")).exists() || is_temporary(id) {
+            continue;
+        }
+        let guard = profile_guard(id);
+        let _g = guard.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::process::Tracker::shared().is_running(id) || lock_alive(id) {
+            continue;
+        }
+        let res = if dir.join("trash").join(id).exists() {
+            // Deleted on another machine; the local trash keeps it for 7 days.
+            // A restore here lifts the tombstone (unforget), so this only
+            // sees profiles nobody restored.
+            changed += 1;
+            crate::trash::move_to_trash(id).map(|_| ())
+        } else {
+            publish(&dir, id).map(|_| ())
+        };
+        if let Err(e) = res {
+            eprintln!("[sync] reconcile {id}: {e}");
+        }
+    }
+    if changed > 0 {
+        crate::notify_store_changed("profiles");
+    }
+    Ok(changed)
+}
+
+/// Started once at app launch; cheap when auto sync is off.
+pub fn spawn_reconciler() {
+    std::thread::spawn(|| loop {
+        if auto_target().is_some() {
+            if let Err(e) = reconcile() {
+                eprintln!("[sync] reconcile: {e}");
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    });
+}
+
+#[derive(Serialize)]
+pub struct AutoStatus {
+    pub target: Option<String>,
+    pub machine: String,
+    pub locks: Vec<LockView>,
+}
+
+#[derive(Serialize)]
+pub struct LockView {
+    pub id: String,
+    pub host: String,
+    pub mine: bool,
+    pub minutes_ago: u64,
+    pub stale: bool,
+}
+
+pub fn auto_status() -> AutoStatus {
+    let target = auto_target();
+    let locks = target
+        .as_deref()
+        .and_then(target_dir)
+        .and_then(|d| fs::read_dir(d.join("locks")).ok().map(|rd| (d, rd)))
+        .map(|(d, rd)| {
+            rd.flatten()
+                .filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".json").map(String::from))
+                .filter(|id| valid_id(id))
+                .filter_map(|id| {
+                    let l = remote_lock(&d, &id)?;
+                    let ago = unix_now().saturating_sub(l.at);
+                    Some(LockView { mine: l.machine == machine_id(), host: l.host, minutes_ago: ago / 60, stale: ago >= LOCK_STALE_SECS, id })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    AutoStatus { target, machine: machine_id(), locks }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,6 +1349,194 @@ mod tests {
         assert!(!contains(&data, &base.join("elsewhere")));
         assert!(!contains(&data, &base.join("data/../Backup")), "a sibling named through .. is not inside");
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// One shared sandbox for the auto-sync tests: temp config + data root,
+    /// auto sync on a temp "nas" folder. The mutex keeps them from overlapping.
+    fn sandbox() -> (std::sync::MutexGuard<'static, ()>, PathBuf, PathBuf) {
+        static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let g = M.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("shardx-auto-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (cfg, data, share) = (base.join("config"), base.join("data"), base.join("share/ShardX-Sync"));
+        for d in [&cfg, &data, &share] {
+            fs::create_dir_all(d).unwrap();
+        }
+        std::env::set_var("SHARDX_TEST_CONFIG", &cfg);
+        store::set_data_root(Some(data.clone()));
+        fs::write(cfg.join("sync.json"), serde_json::json!({ "nas": share, "auto": "nas" }).to_string()).unwrap();
+        (g, data, share)
+    }
+
+    const ID: &str = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee";
+
+    fn profile(root: &Path, cookies: Option<&str>) {
+        fs::create_dir_all(root.join("profiles")).unwrap();
+        fs::write(root.join("profiles").join(format!("{ID}.json")), format!("{{\"_meta\":{{\"id\":\"{ID}\"}},\"name\":\"P\"}}")).unwrap();
+        if let Some(c) = cookies {
+            fs::create_dir_all(root.join("user-data").join(ID).join("Default")).unwrap();
+            fs::write(root.join("user-data").join(ID).join("Default/Cookies"), c).unwrap();
+        }
+    }
+
+    fn cookies(root: &Path) -> Option<String> {
+        fs::read_to_string(root.join("user-data").join(ID).join("Default/Cookies")).ok()
+    }
+
+    fn other_state(share: &Path, rev: u64) {
+        let files = manifest(&share.join("user-data").join(ID));
+        write_json(&share.join("state").join(format!("{ID}.json")), &RemoteState { rev, machine: "other".into(), host: "mac-B".into(), at: unix_now(), files }).unwrap();
+    }
+
+    #[test]
+    fn old_style_backup_is_pulled_never_overwritten_by_an_empty_profile() {
+        let (_g, data, share) = sandbox();
+        profile(&share, Some("A-REAL-LOGIN")); // no state/<id>.json
+        profile(&data, None); // JSON only, as reconcile leaves it
+        before_launch(ID).unwrap();
+        assert_eq!(cookies(&data).as_deref(), Some("A-REAL-LOGIN"));
+        abort_launch(ID);
+    }
+
+    #[test]
+    fn close_never_overwrites_a_newer_remote_copy() {
+        let (_g, data, share) = sandbox();
+        profile(&data, Some("mine"));
+        publish(&share, ID).unwrap(); // rev 1, in sync
+        fs::write(share.join("user-data").join(ID).join("Default/Cookies"), "B-NEW-WORK").unwrap();
+        other_state(&share, 5);
+        after_exit(ID);
+        assert_eq!(cookies(&share).as_deref(), Some("B-NEW-WORK"));
+        assert!(get_local(&share, ID).dirty);
+    }
+
+    #[test]
+    fn changes_made_here_outside_sync_raise_a_conflict() {
+        let (_g, data, share) = sandbox();
+        profile(&data, Some("v1"));
+        publish(&share, ID).unwrap();
+        fs::write(data.join("user-data").join(ID).join("Default/Cookies"), "changed with auto sync off").unwrap();
+        other_state(&share, 2);
+        let err = before_launch(ID).unwrap_err().to_string();
+        assert!(err.contains("changed both"), "{err}");
+        assert_eq!(cookies(&data).as_deref(), Some("changed with auto sync off"));
+    }
+
+    #[test]
+    fn a_failed_launch_gives_the_lock_back() {
+        let (_g, data, share) = sandbox();
+        profile(&data, Some("x"));
+        before_launch(ID).unwrap();
+        assert!(remote_lock(&share, ID).is_some());
+        abort_launch(ID);
+        assert!(remote_lock(&share, ID).is_none());
+    }
+
+    #[test]
+    fn another_machines_live_lock_blocks_start() {
+        let (_g, data, share) = sandbox();
+        profile(&data, Some("x"));
+        write_json(&share.join("locks").join(format!("{ID}.json")), &Lock { machine: "other".into(), host: "mac-B".into(), at: unix_now() }).unwrap();
+        assert!(before_launch(ID).unwrap_err().to_string().contains("open on mac-B"));
+        assert!(check_can_forget(ID).is_err());
+    }
+
+    #[test]
+    fn a_restore_while_the_folder_was_away_lifts_the_tombstone_later() {
+        let (_g, data, share) = sandbox();
+        fs::create_dir_all(share.join("trash").join(ID)).unwrap();
+        profile(&data, Some("restored"));
+        set_pending(ID, Some("unforget")); // what unforget() queues when unreachable
+        reconcile().unwrap();
+        assert!(!share.join("trash").join(ID).exists());
+        assert!(share.join("profiles").join(format!("{ID}.json")).exists());
+        assert!(data.join("profiles").join(format!("{ID}.json")).exists());
+        assert!(pending().is_empty());
+    }
+
+    #[test]
+    fn a_profile_deleted_elsewhere_will_not_start_here() {
+        let (_g, data, share) = sandbox();
+        profile(&data, Some("x"));
+        fs::create_dir_all(share.join("trash").join(ID)).unwrap();
+        assert!(before_launch(ID).unwrap_err().to_string().contains("deleted on another machine"));
+    }
+
+    #[test]
+    fn full_backup_leaves_a_copy_another_machine_moved_ahead() {
+        let (_g, data, share) = sandbox();
+        profile(&data, Some("A-OLD"));
+        publish(&share, ID).unwrap(); // rev 1
+        fs::write(share.join("user-data").join(ID).join("Default/Cookies"), "B-NEW-WORK").unwrap();
+        other_state(&share, 2);
+        let r = push("nas", None).unwrap();
+        assert_eq!(r.skipped, vec![ID.to_string()]);
+        assert_eq!(cookies(&share).as_deref(), Some("B-NEW-WORK"));
+    }
+
+    #[test]
+    fn same_size_stale_file_is_not_taken_as_arrived() {
+        let (_g, _data, share) = sandbox();
+        profile(&share, Some("NEW-COOKIE"));
+        other_state(&share, 3); // hashes "NEW-COOKIE"
+        fs::write(share.join("user-data").join(ID).join("Default/Cookies"), "OLD-COOKIE").unwrap(); // same size
+        assert!(!arrived(&share, ID, &remote_state(&share, ID).unwrap(), &mut Default::default()));
+    }
+
+    #[test]
+    fn identical_old_style_copies_are_adopted_without_a_conflict() {
+        let (_g, data, share) = sandbox();
+        profile(&data, Some("same"));
+        copy_profile(&data, &share, ID).unwrap(); // old manual backup, no state, same files + mtimes
+        before_launch(ID).unwrap();
+        abort_launch(ID);
+        assert!(!get_local(&share, ID).fp.is_empty());
+    }
+
+    #[test]
+    fn fingerprint_matches_mcp_sync_js() {
+        // Same fixture hashed by mcp/sync.js fingerprint(): 931d2162a554b070.
+        let d = std::env::temp_dir().join(format!("shardx-fp-{}", std::process::id()));
+        fs::create_dir_all(d.join("Default")).unwrap();
+        fs::write(d.join("Default/Cookies"), "hello").unwrap();
+        fs::write(d.join("Local State"), "ab").unwrap();
+        for (f, t) in [("Default/Cookies", 1699974800u64), ("Local State", 1699974900)] {
+            let m = std::time::UNIX_EPOCH + std::time::Duration::from_secs(t);
+            fs::File::options().write(true).open(d.join(f)).unwrap().set_modified(m).unwrap();
+        }
+        assert_eq!(fingerprint(&d), "931d2162a554b070");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_unreadable_state_file_is_never_read_as_no_state() {
+        let (_g, data, share) = sandbox();
+        profile(&data, Some("mine"));
+        publish(&share, ID).unwrap();
+        fs::write(share.join("state").join(format!("{ID}.json")), "{\"rev\": 9, \"trunc").unwrap();
+        assert!(before_launch(ID).unwrap_err().to_string().contains("still downloading or damaged"));
+        after_exit(ID);
+        assert!(state_unreadable(&share, ID), "close must not publish over it");
+        assert!(get_local(&share, ID).dirty);
+    }
+
+    #[test]
+    fn a_stray_file_beside_the_upload_means_not_arrived() {
+        let (_g, _data, share) = sandbox();
+        profile(&share, Some("NEW"));
+        other_state(&share, 2);
+        fs::write(share.join("user-data").join(ID).join("Default/Cookies-journal"), "stale").unwrap();
+        assert!(!arrived(&share, ID, &remote_state(&share, ID).unwrap(), &mut Default::default()));
+    }
+
+    #[test]
+    fn a_queued_delete_does_not_trash_a_profile_restored_since() {
+        let (_g, data, share) = sandbox();
+        profile(&data, Some("back"));
+        set_pending(ID, Some("forget"));
+        reconcile().unwrap();
+        assert!(data.join("profiles").join(format!("{ID}.json")).exists());
+        assert!(!share.join("trash").join(ID).exists());
     }
 
     #[test]

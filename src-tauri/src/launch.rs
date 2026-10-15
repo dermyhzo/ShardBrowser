@@ -64,6 +64,28 @@ pub async fn launch_profile_synced(
     if Tracker::shared().is_running(profile_id) {
         anyhow::bail!("profile {profile_id} is already running");
     }
+    // Auto sync: pull the newest copy and take the profile's lock first, and
+    // give the lock back if the launch then fails.
+    {
+        let id = profile_id.to_string();
+        tokio::task::spawn_blocking(move || crate::cloud_sync::before_launch(&id)).await??;
+    }
+    let out = launch_after_sync(profile_id, enable_cdp, headless, sync_group, bus_port, bus_token).await;
+    if out.is_err() {
+        let id = profile_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || crate::cloud_sync::abort_launch(&id)).await;
+    }
+    out
+}
+
+async fn launch_after_sync(
+    profile_id: &str,
+    enable_cdp: bool,
+    headless: bool,
+    sync_group: Option<&str>,
+    bus_port: u16,
+    bus_token: &str,
+) -> Result<LaunchOutcome> {
     let bin = resolve_binary()?;
     let stored = profile::load_raw(profile_id)?;
     let udd = profile::user_data_dir(profile_id)?;

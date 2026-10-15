@@ -68,7 +68,8 @@ Override with `sync_set_target` / `node sync.js set nas <folder>` (saved in
 `sync.json` next to `settings.json`) or `SHARDX_NAS_DIR` / `SHARDX_GDRIVE_DIR`.
 
 MCP tools: `sync_status`, `sync_set_target(target, folder)`,
-`sync_push(target, profile_id?)`, `sync_pull(target, profile_id?)`.
+`sync_push(target, profile_id?)`, `sync_pull(target, profile_id?)`,
+`sync_set_auto(target)`, `sync_take_over(profile_id)`.
 Push never deletes anything already in the backup (a push from a fresh
 machine cannot wipe another machine's profiles). Each pushed or pulled profile
 is copied as an exact replica of its user-data dir. A full pull keeps
@@ -77,7 +78,16 @@ replaced by an empty copy, and a replaced one is kept as `<file>.<stamp>.bak`.
 Profile ids must be uuids; `sync.js` needs rsync, so it is macOS / Linux only.
 `proxies.json` travels too, credentials included, so keep the folder private.
 
-CLI: `node sync.js status | push gdrive [id] | pull nas [id] | set nas <folder>`.
+**Auto sync.** `sync_set_auto("gdrive")` (or the switch in the launcher's
+panel) makes the launcher pull a profile on Start, lock it in the folder
+(`locks/<id>.json`, refreshed every 2 min, abandoned after 10), and push it
+back when the browser closes (`state/<id>.json` carries a rev plus a file
+manifest, so another machine waits until the upload has fully arrived).
+`sync_take_over(profile_id)` drops the lock of a machine that died with the
+profile open. Pushes from `sync.js` follow the same protocol and refuse a
+profile another machine has open.
+
+CLI: `node sync.js status | push gdrive [id] | pull nas [id] | set nas <folder> | auto gdrive | takeover <id>`.
 
 `SHARDX_TOKEN` and `SHARDX_API` are optional now: when unset the server mints
 a token from the launcher's own `settings.json`, so registering is just

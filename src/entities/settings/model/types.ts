@@ -78,4 +78,13 @@ export interface CloudSyncResult {
   dir: string;
   profiles: number;
   files_copied: number;
+  /** Left alone because another machine has them open. */
+  skipped: string[];
+}
+
+export interface CloudSyncAuto {
+  /** Target that syncs on open/close, or null when auto sync is off. */
+  target: "nas" | "gdrive" | null;
+  machine: string;
+  locks: { id: string; host: string; mine: boolean; minutes_ago: number; stale: boolean }[];
 }

@@ -60,6 +60,7 @@ fn paths_for(id: &str) -> Result<(PathBuf, PathBuf)> {
 /// Archive the profile, then delete the original. The archive holds the
 /// profile JSON verbatim plus the kept user-data files under `user-data/`.
 pub fn move_to_trash(id: &str) -> Result<TrashEntry> {
+    crate::cloud_sync::check_can_forget(id)?;
     let stored = profile::load_raw(id)?;
     let (zip_path, meta_path) = paths_for(id)?;
 
@@ -102,6 +103,7 @@ pub fn move_to_trash(id: &str) -> Result<TrashEntry> {
     fs::write(&meta_path, serde_json::to_string_pretty(&entry)?)?;
 
     profile::delete(id)?;
+    crate::cloud_sync::forget(id);
     Ok(entry)
 }
 
@@ -192,6 +194,7 @@ pub fn restore(id: &str) -> Result<profile::ProfileMeta> {
     let _ = fs::remove_file(&zip_path);
     let _ = fs::remove_file(&meta_path);
 
+    crate::cloud_sync::unforget(id);
     Ok(profile::ProfileMeta {
         id: stored.meta.id.clone(),
         name: stored

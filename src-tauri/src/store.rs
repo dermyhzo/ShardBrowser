@@ -9,6 +9,13 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
 
 pub fn config_root() -> Result<PathBuf> {
+    // Tests point the config at a temp dir instead of the user's real one.
+    #[cfg(test)]
+    if let Ok(p) = std::env::var("SHARDX_TEST_CONFIG") {
+        let p = PathBuf::from(p);
+        std::fs::create_dir_all(&p)?;
+        return Ok(p);
+    }
     let base = dirs::config_dir().context("OS config dir unavailable")?;
     let root = base.join("shardx-launcher");
     std::fs::create_dir_all(&root)?;

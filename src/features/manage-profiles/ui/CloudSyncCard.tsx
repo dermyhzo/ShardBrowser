@@ -1,14 +1,15 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
-import { Button, SegmentControl, Select } from "@proxyshard/shardx-ui-kit";
+import { Button, SegmentControl, Select, Switch } from "@proxyshard/shardx-ui-kit";
 import { DownloadIcon, FolderIcon, RefreshIcon, UploadIcon } from "../../../shared/icons";
 import { toast } from "../../../shared/model/toast";
 import { confirmModal } from "../../../shared/lib/confirm";
 import { useT } from "../../../shared/i18n";
 import {
   cloudSyncStatus, cloudSyncSetTarget, cloudSyncPush, cloudSyncPull,
-  type CloudSyncTarget,
+  cloudSyncAutoStatus, cloudSyncSetAuto, cloudSyncTakeOver,
+  type CloudSyncTarget, type CloudSyncAuto,
 } from "../../../entities/settings";
 import { profileList, type ProfileMeta } from "../../../entities/profile";
 
@@ -23,12 +24,19 @@ export function CloudSyncCard() {
   const [local, setLocal] = useState<ProfileMeta[]>([]);
   const [profile, setProfile] = useState(ALL);
   const [busy, setBusy] = useState<string | null>(null);
+  const [auto, setAuto] = useState<CloudSyncAuto | null>(null);
 
   const refresh = () => {
     cloudSyncStatus().then(setTargets).catch(() => {});
+    cloudSyncAutoStatus().then(setAuto).catch(() => {});
     profileList().then(setLocal).catch(() => {});
   };
   useEffect(refresh, []);
+  // Locks and new profiles arrive from other machines; keep the list current.
+  useEffect(() => {
+    const h = setInterval(refresh, 15000);
+    return () => clearInterval(h);
+  }, []);
 
   const cur = targets.find((x) => x.name === sel);
   const ready = !!cur?.dir && cur.reachable;
@@ -65,6 +73,7 @@ export function CloudSyncCard() {
       const r = await (kind === "push" ? cloudSyncPush : cloudSyncPull)(sel, ids);
       const vars = { n: r.profiles, files: r.files_copied, target: label(sel) };
       toast.ok(kind === "push" ? t("cloudSync.pushedOk", vars) : t("cloudSync.pulledOk", vars));
+      if (r.skipped.length) toast.err(t("cloudSync.skippedOpen", { n: r.skipped.length }));
     } catch (e) {
       toast.err(String(e));
     } finally {
@@ -73,6 +82,30 @@ export function CloudSyncCard() {
     }
   };
   const ids = profile === ALL ? undefined : [profile];
+  const autoHere = auto?.target === sel;
+
+  const toggleAuto = async (on: boolean) => {
+    try {
+      await cloudSyncSetAuto(on ? sel : null);
+      toast.ok(on ? t("cloudSync.autoOnToast", { target: label(sel) }) : t("cloudSync.autoOffToast"));
+    } catch (e) { toast.err(String(e)); }
+    refresh();
+  };
+
+  const takeOver = async (id: string, host: string) => {
+    const ok = await confirmModal({
+      title: t("cloudSync.takeOverTitle"),
+      message: t("cloudSync.takeOverMessage", { host }),
+      buttons: [
+        { label: t("cloudSync.cancel"), value: false },
+        { label: t("cloudSync.takeOver"), value: true, primary: true },
+      ],
+    });
+    if (ok !== true) return;
+    try { await cloudSyncTakeOver(id); toast.ok(t("cloudSync.takenOver")); }
+    catch (e) { toast.err(String(e)); }
+    refresh();
+  };
 
   return (
     <div className="flex flex-col gap-3">
@@ -123,6 +156,20 @@ export function CloudSyncCard() {
         )}
       </label>
 
+      <div className="flex flex-col gap-1 rounded-8 bg-bg-weak-50 p-3 ring-1 ring-inset ring-stroke-soft-200">
+        <Switch
+          label={t("cloudSync.autoLabel", { target: label(sel) })}
+          checked={autoHere}
+          disabled={!ready && !autoHere}
+          onChange={toggleAuto}
+        />
+        <span className="text-paragraph-xs text-text-soft-400">
+          {auto?.target && !autoHere
+            ? t("cloudSync.autoElsewhere", { target: label(auto.target) })
+            : t("cloudSync.autoHelp")}
+        </span>
+      </div>
+
       <div className="flex flex-wrap items-end gap-2">
         <div className="min-w-[220px] flex-1">
           <Select
@@ -160,15 +207,32 @@ export function CloudSyncCard() {
           ) : (
             cur!.profiles.map((p) => {
               const here = local.some((l) => l.id === p.id);
+              const lock = autoHere ? auto?.locks.find((l) => l.id === p.id) : undefined;
               return (
                 <div key={p.id} className="flex items-center gap-2 border-b border-stroke-soft-200 px-3 py-1.5 last:border-b-0">
                   <span className="min-w-0 flex-1 truncate text-paragraph-xs text-text-strong-950">
                     {p.name || p.id}
                     <span className="mono ml-2 text-text-soft-400">{p.id.slice(0, 8)}</span>
                   </span>
-                  <span className="text-paragraph-xs text-text-soft-400">
-                    {here ? t("cloudSync.alsoLocal") : t("cloudSync.onlyRemote")}
-                  </span>
+                  {lock ? (
+                    <span className={`text-paragraph-xs ${lock.mine ? "text-success-base" : lock.stale ? "text-text-soft-400" : "text-warning-base"}`}>
+                      {lock.mine
+                        ? t("cloudSync.openHere")
+                        : lock.stale
+                          ? t("cloudSync.openStale", { host: lock.host, min: lock.minutes_ago })
+                          : t("cloudSync.openOn", { host: lock.host, min: lock.minutes_ago })}
+                    </span>
+                  ) : (
+                    <span className="text-paragraph-xs text-text-soft-400">
+                      {here ? t("cloudSync.alsoLocal") : t("cloudSync.onlyRemote")}
+                    </span>
+                  )}
+                  {lock && !lock.mine && (
+                    <Button variant="neutral" mode="stroke" size="xsmall" disabled={!!busy}
+                      onClick={() => takeOver(p.id, lock.host)}>
+                      {t("cloudSync.takeOver")}
+                    </Button>
+                  )}
                   <Button variant="neutral" mode="stroke" size="xsmall" disabled={!!busy}
                     isLoading={busy === `pull:${p.id}`} onClick={() => run("pull", [p.id], p.id)}>
                     {t("cloudSync.restore")}
