@@ -51,6 +51,34 @@ If you'd rather host it yourself and connect by URL, run it with
 MCP_HTTP_PORT=40326 SHARDX_API=http://127.0.0.1:40325 SHARDX_TOKEN=… node index.js
 ```
 
+## Sync to NAS / Google Drive (fork addition)
+
+`sync.js` backs profiles up to a NAS or Google Drive folder and restores them,
+so the same identities can move between machines. It copies snapshots with
+`rsync` (caches skipped) instead of running the data root on the share:
+Chromium's SQLite files corrupt when a sync client touches them mid-write.
+Profiles must be stopped; running ones are refused.
+
+| Target   | Default folder                                                        |
+| -------- | --------------------------------------------------------------------- |
+| `gdrive` | `~/Library/CloudStorage/GoogleDrive-*/My Drive/ShardX-Sync`           |
+| `nas`    | `~/SynologyDrive/ShardX-Sync`, or set an SMB mount like `/Volumes/<share>/ShardX-Sync` |
+
+Override with `sync_set_target` / `node sync.js set nas <folder>` (saved in
+`sync.json` next to `settings.json`) or `SHARDX_NAS_DIR` / `SHARDX_GDRIVE_DIR`.
+
+MCP tools: `sync_status`, `sync_set_target(target, folder)`,
+`sync_push(target, profile_id?)`, `sync_pull(target, profile_id?)`.
+Full push mirrors (deletes on the target what was deleted locally); full pull
+merges (keeps local-only profiles); a single-profile pull replaces that profile.
+`proxies.json` travels too, credentials included, so keep the folder private.
+
+CLI: `node sync.js status | push gdrive [id] | pull nas [id] | set nas <folder>`.
+
+`SHARDX_TOKEN` and `SHARDX_API` are optional now: when unset the server mints
+a token from the launcher's own `settings.json`, so registering is just
+`claude mcp add -s user shardx -- node /ABSOLUTE/PATH/mcp/index.js`.
+
 ## Environment
 
 | Var             | Default                  | Notes                                               |

@@ -15,9 +15,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { chromium } from "patchright";
+import * as sync from "./sync.js";
 
-const API = (process.env.SHARDX_API || "http://127.0.0.1:40325").replace(/\/+$/, "");
-const TOKEN = process.env.SHARDX_TOKEN || "";
+// Both fall back to the launcher's own settings.json, so local use needs no env.
+const API = (process.env.SHARDX_API || sync.localApi()).replace(/\/+$/, "");
+const TOKEN = process.env.SHARDX_TOKEN || sync.localToken();
 
 // ---------- HTTP API helper ----------
 
@@ -202,6 +204,38 @@ const text = (v) => ({
 });
 
 const server = new McpServer({ name: "shardx", version: "0.1.0" });
+
+// ================= Storage sync (NAS / Google Drive) =================
+
+const target = z.enum(["nas", "gdrive"]).describe("nas = Synology/SMB folder, gdrive = Google Drive folder");
+
+server.tool(
+  "sync_status",
+  "Show sync folders for NAS and Google Drive, which profiles are stored there, last push, and which local profiles are running.",
+  {},
+  async () => text(sync.status()),
+);
+
+server.tool(
+  "sync_set_target",
+  "Set the folder used for a sync target, e.g. nas → /Volumes/<share>/ShardX-Sync. The parent folder must exist (share mounted).",
+  { target, folder: z.string() },
+  async ({ target, folder }) => text(sync.setTarget(target, folder)),
+);
+
+server.tool(
+  "sync_push",
+  "Back up profiles (fingerprint, cookies, logins, storage; caches skipped) to NAS or Google Drive. Without profile_id: mirrors all profiles plus proxies/bookmarks/automation. Profiles must be stopped.",
+  { target, profile_id: z.string().optional() },
+  async ({ target, profile_id }) => text(sync.push(target, profile_id)),
+);
+
+server.tool(
+  "sync_pull",
+  "Restore profiles from NAS or Google Drive. With profile_id: replaces that profile locally. Without: merges every stored profile and config in, keeping local-only profiles. Profiles must be stopped.",
+  { target, profile_id: z.string().optional() },
+  async ({ target, profile_id }) => text(sync.pull(target, profile_id)),
+);
 
 // ================= API tools =================
 
