@@ -87,6 +87,23 @@ Configuration details are available in [Usage](#usage).
   </kbd>
 </p>
 
+> **Fork notes (dermyhzo/ShardBrowser).** Adds on top of upstream:
+> * **Settings → Sync to NAS / Google Drive:** back up and restore profiles
+>   (fingerprint, cookies, logins, site storage; caches skipped) to a Synology
+>   Drive folder, a mounted SMB share or Google Drive for desktop. Per profile
+>   or all at once; running profiles are refused so Chromium's databases are
+>   never copied mid-write.
+> * **MCP sync tools:** `sync_status`, `sync_set_target`, `sync_push`,
+>   `sync_pull` (see [mcp/README.md](mcp/README.md)), sharing the same
+>   `sync.json` as the panel. The MCP server now mints its own API token from
+>   `settings.json`, so `claude mcp add -s user shardx -- node /path/mcp/index.js`
+>   is the whole setup.
+> * **CDN downloads resolve over Cloudflare DoH,** so first-run setup works on
+>   ISPs that DNS-block `r2.dev` (e.g. Indonesia).
+>
+> The in-app *Download MCP server* button still fetches upstream's bundle; use
+> `mcp/` from this repo for the sync tools.
+
 ---
 
 ## What it is

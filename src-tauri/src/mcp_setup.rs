@@ -22,7 +22,9 @@ const MCP_TOP_DIR: &str = "ShardX-MCP";
 /// Download the MCP server into `<dir>/mcp` and return that path.
 pub async fn download_mcp(dir: &Path) -> Result<PathBuf> {
     let dest = dir.join("mcp");
-    let bytes = reqwest::get(MCP_ARCHIVE_URL)
+    let bytes = crate::runtime::cdn_client()
+        .get(MCP_ARCHIVE_URL)
+        .send()
         .await
         .context("download MCP archive")?
         .error_for_status()

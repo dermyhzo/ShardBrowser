@@ -69,8 +69,12 @@ Override with `sync_set_target` / `node sync.js set nas <folder>` (saved in
 
 MCP tools: `sync_status`, `sync_set_target(target, folder)`,
 `sync_push(target, profile_id?)`, `sync_pull(target, profile_id?)`.
-Full push mirrors (deletes on the target what was deleted locally); full pull
-merges (keeps local-only profiles); a single-profile pull replaces that profile.
+Push never deletes anything already in the backup (a push from a fresh
+machine cannot wipe another machine's profiles). Each pushed or pulled profile
+is copied as an exact replica of its user-data dir. A full pull keeps
+local-only profiles. Config files (proxies, bookmarks, automation) never get
+replaced by an empty copy, and a replaced one is kept as `<file>.<stamp>.bak`.
+Profile ids must be uuids; `sync.js` needs rsync, so it is macOS / Linux only.
 `proxies.json` travels too, credentials included, so keep the folder private.
 
 CLI: `node sync.js status | push gdrive [id] | pull nas [id] | set nas <folder>`.

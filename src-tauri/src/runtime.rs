@@ -819,10 +819,62 @@ async fn install_fingerprints(
     Ok(Some(etag))
 }
 
+/// Client for the R2 CDN. `r2.dev` is blocked by DNS on some ISPs (Indonesia
+/// answers with a block page), so names are resolved over Cloudflare DoH
+/// first and the system resolver is only the fallback.
+pub fn cdn_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .dns_resolver(std::sync::Arc::new(DohResolver))
+        .build()
+        .unwrap_or_default()
+}
+
+struct DohResolver;
+
+impl reqwest::dns::Resolve for DohResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs = match doh_lookup(&host).await {
+                Some(a) if !a.is_empty() => a,
+                _ => tokio::net::lookup_host((host.as_str(), 0)).await?.collect(),
+            };
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+async fn doh_lookup(host: &str) -> Option<Vec<std::net::SocketAddr>> {
+    // An IP-literal endpoint, so this lookup needs no DNS of its own.
+    // ponytail: A records only; IPv6-only hosts fall through to system DNS.
+    static DOH: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let v: serde_json::Value = DOH
+        .get_or_init(reqwest::Client::new)
+        .get("https://1.1.1.1/dns-query")
+        .query(&[("name", host), ("type", "A")])
+        .header("accept", "application/dns-json")
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    Some(
+        v.get("Answer")?
+            .as_array()?
+            .iter()
+            .filter(|a| a.get("type").and_then(|t| t.as_u64()) == Some(1))
+            .filter_map(|a| a.get("data")?.as_str()?.parse::<std::net::IpAddr>().ok())
+            .map(|ip| std::net::SocketAddr::new(ip, 0))
+            .collect(),
+    )
+}
+
 /// Stream archive → temp file → extract; emits `runtime:progress` events.
 async fn download_and_extract(window: &Window, spec: &ArchiveSpec, base: &Path) -> Result<String> {
     let url = format!("{PUB_BASE}/{}", spec.key);
-    let mut resp = reqwest::Client::new().get(&url).send().await?.error_for_status()?;
+    let mut resp = cdn_client().get(&url).send().await?.error_for_status()?;
     let total = resp.content_length().unwrap_or(0);
     let etag = resp
         .headers()

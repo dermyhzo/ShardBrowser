@@ -208,6 +208,7 @@ const server = new McpServer({ name: "shardx", version: "0.1.0" });
 // ================= Storage sync (NAS / Google Drive) =================
 
 const target = z.enum(["nas", "gdrive"]).describe("nas = Synology/SMB folder, gdrive = Google Drive folder");
+const syncProfileId = z.string().regex(/^[0-9a-f-]{36}$/i, "a profile uuid").optional();
 
 server.tool(
   "sync_status",
@@ -225,15 +226,15 @@ server.tool(
 
 server.tool(
   "sync_push",
-  "Back up profiles (fingerprint, cookies, logins, storage; caches skipped) to NAS or Google Drive. Without profile_id: mirrors all profiles plus proxies/bookmarks/automation. Profiles must be stopped.",
-  { target, profile_id: z.string().optional() },
+  "Back up profiles (fingerprint, cookies, logins, storage; caches skipped) to NAS or Google Drive. Without profile_id: every local profile plus proxies/bookmarks/automation. Never deletes a profile from the backup; an empty local config never replaces a filled one and replaced config is kept as *.bak. Profiles must be stopped.",
+  { target, profile_id: syncProfileId },
   async ({ target, profile_id }) => text(sync.push(target, profile_id)),
 );
 
 server.tool(
   "sync_pull",
-  "Restore profiles from NAS or Google Drive. With profile_id: replaces that profile locally. Without: merges every stored profile and config in, keeping local-only profiles. Profiles must be stopped.",
-  { target, profile_id: z.string().optional() },
+  "Restore profiles from NAS or Google Drive. With profile_id: replaces that profile locally. Without: restores every stored profile and the config (replaced local config kept as *.bak), keeping local-only profiles. Profiles must be stopped.",
+  { target, profile_id: syncProfileId },
   async ({ target, profile_id }) => text(sync.pull(target, profile_id)),
 );
 

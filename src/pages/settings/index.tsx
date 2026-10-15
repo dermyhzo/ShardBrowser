@@ -11,6 +11,7 @@ import type { Settings, ApiInfo } from "../../entities/settings";
 import { HELPER_KINDS } from "../../entities/settings";
 import { settingsGet, settingsSave, settingsLoadError, apiInfo, apiRegenerateToken, mcpDownload } from "../../entities/settings";
 import { DataRootCard } from "../../features/manage-profiles/ui/DataRootCard";
+import { CloudSyncCard } from "../../features/manage-profiles/ui/CloudSyncCard";
 import { useT, useLang, LANG_OPTIONS, type Lang } from "../../shared/i18n";
 
 function SettingsCard({ title, children }: { title: string; children: React.ReactNode }) {
@@ -194,6 +195,10 @@ export function SettingsPage() {
 
       <SettingsCard title={t("settings.dataLocationTitle")}>
         <DataRootCard />
+      </SettingsCard>
+
+      <SettingsCard title={t("settings.cloudSyncTitle")}>
+        <CloudSyncCard />
       </SettingsCard>
 
       <SettingsCard title={t("settings.extraArgsTitle")}>

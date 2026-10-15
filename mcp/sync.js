@@ -9,11 +9,14 @@
 //   node sync.js set <nas|gdrive> <folder>
 //   node sync.js push <nas|gdrive> [profile_id]
 //   node sync.js pull <nas|gdrive> [profile_id]
+//
+// macOS / Linux only (needs rsync); the launcher's Settings panel covers Windows.
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { createHmac } from "node:crypto";
 
 const HOME = os.homedir();
@@ -22,7 +25,7 @@ export const CONFIG_ROOT =
     ? path.join(HOME, "Library/Application Support/shardx-launcher")
     : process.platform === "win32"
       ? path.join(process.env.APPDATA || "", "shardx-launcher")
-      : path.join(HOME, ".config/shardx-launcher");
+      : path.join(process.env.XDG_CONFIG_HOME || path.join(HOME, ".config"), "shardx-launcher");
 const SYNC_CONF = path.join(CONFIG_ROOT, "sync.json");
 
 const readJson = (p, d) => {
@@ -65,19 +68,53 @@ export function targets() {
 export function setTarget(name, dir) {
   if (!["nas", "gdrive"].includes(name)) throw new Error("target must be nas or gdrive");
   const conf = readJson(SYNC_CONF, {});
-  conf[name] = path.resolve(dir.replace(/^~(?=\/|$)/, HOME));
+  // Blank goes back to the detected default, same as the launcher's panel.
+  if (!dir || !dir.trim()) delete conf[name];
+  else conf[name] = path.resolve(dir.trim().replace(/^~(?=\/|$)/, HOME));
   fs.writeFileSync(SYNC_CONF, JSON.stringify(conf, null, 2));
   return targets();
 }
 
-function resolveTarget(name) {
+// Folders whose children are mount points.
+const MOUNT_ROOTS = ["/Volumes", "/mnt", "/media", "/run/media"];
+
+function resolveTarget(name, mustExist) {
   const dir = targets()[name];
   if (!dir) throw new Error(`no folder set for "${name}". Run: set ${name} <folder> (e.g. /Volumes/<share>/ShardX-Sync)`);
-  // The parent must already exist: a missing /Volumes/share means the NAS is
-  // not mounted, and creating it would write into the local disk instead.
-  if (!fs.existsSync(path.dirname(dir))) throw new Error(`${path.dirname(dir)} not found (NAS not mounted / Drive not running?)`);
+  if (!path.isAbsolute(dir)) throw new Error(`${dir} is not an absolute path`);
+  // Compared by file identity, not spelling: a symlink, other letter case,
+  // a trailing slash or ".." must not slip a self-copy through.
+  for (const local of [dataRoot(), CONFIG_ROOT]) {
+    if (contains(local, dir) || contains(dir, local)) throw new Error(`${dir} overlaps the launcher's own data at ${local}`);
+  }
+  if (mustExist && !fs.existsSync(dir)) throw new Error(`${dir} not found (NAS not mounted, Drive not running, or nothing backed up yet)`);
+  // Creating the folder under an unmounted share would write the backup onto
+  // the local disk instead: refuse when the parent is missing, or when the
+  // folder would be a mount point of its own (/Volumes/<share>).
+  const parent = path.dirname(dir);
+  if (!fs.existsSync(dir) && (!fs.existsSync(parent) || MOUNT_ROOTS.includes(parent))) {
+    throw new Error(`${dir} not found (NAS not mounted / Drive not running?)`);
+  }
   fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+// Whether `inner` is `outer` or lies beneath it, asked of the file system.
+function contains(outer, inner) {
+  let o;
+  try { o = fs.statSync(outer); } catch { return false; }
+  for (let a = path.resolve(inner); ; a = path.dirname(a)) {
+    try { const m = fs.statSync(a); if (m.dev === o.dev && m.ino === o.ino) return true; } catch {}
+    if (path.dirname(a) === a) return false;
+  }
+}
+
+// Profile ids are uuids; anything else never reaches a path, so an id like
+// "../.." cannot point a mirror at the parent folder.
+const ID = /^[0-9a-f-]{36}$/i;
+function checkIds(ids) {
+  const bad = ids.find((id) => !ID.test(id));
+  if (bad !== undefined) throw new Error(`invalid profile id: ${bad}`);
 }
 
 // Chromium holds SingletonLock (a symlink to "<host>-<pid>") while the profile
@@ -104,16 +141,36 @@ function rsync(src, dst, extra = []) {
 }
 
 const CONFIG_FILES = ["proxies.json", "proxies-history.json", "bookmarks.json", "automation.json", "psapi.json"];
-const DATA_DIRS = ["profiles", "user-data", "extensions"];
 
+// Config files travel whole, so: an empty file (a fresh install) never
+// replaces a filled one, and a file about to be replaced is kept as
+// <file>.<stamp>.bak first. Same rules as the launcher's panel.
+// What the launcher writes when it holds nothing: {"proxies": []},
+// {"by_proxy": {}}, {"api_key": ""}, or a bare empty value.
+const emptyVal = (v) =>
+  v === null || v === "" || (Array.isArray(v) ? v.length === 0 : typeof v === "object" && Object.values(v).every(emptyVal));
+const isEmptyJson = (b) => {
+  const t = b.toString("utf8").trim();
+  if (!t) return true;
+  try { return emptyVal(JSON.parse(t)); } catch { return false; }
+};
 function copyFiles(srcDir, dstDir, files) {
   fs.mkdirSync(dstDir, { recursive: true });
-  const copied = [];
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "") + "Z";
   for (const f of files) {
-    const s = path.join(srcDir, f);
-    if (fs.existsSync(s)) { fs.copyFileSync(s, path.join(dstDir, f)); copied.push(f); }
+    const s = path.join(srcDir, f), d = path.join(dstDir, f);
+    if (!fs.existsSync(s)) continue;
+    const next = fs.readFileSync(s);
+    const old = fs.existsSync(d) ? fs.readFileSync(d) : null;
+    if (old && old.equals(next)) continue;
+    if (old && !isEmptyJson(old)) {
+      if (isEmptyJson(next)) continue;
+      let bak = `${d}.${stamp}.bak`;
+      for (let n = 1; fs.existsSync(bak); n++) bak = `${d}.${stamp}-${n}.bak`;
+      fs.copyFileSync(d, bak);
+    }
+    fs.writeFileSync(d, next);
   }
-  return copied;
 }
 
 function guardRunning(ids) {
@@ -125,59 +182,73 @@ const du = (p) => {
   try { return execFileSync("du", ["-sh", p], { encoding: "utf8" }).split("\t")[0]; } catch { return "?"; }
 };
 
+const idsIn = (dir) =>
+  fs.existsSync(path.join(dir, "profiles"))
+    ? fs.readdirSync(path.join(dir, "profiles")).filter((f) => f.endsWith(".json")).map((f) => f.slice(0, -5))
+        .filter((id) => ID.test(id) && !readJson(path.join(dir, "profiles", `${id}.json`), {})._meta?.temporary)
+    : [];
+
+// One profile: its JSON plus an exact copy of its user-data dir. Mirroring
+// inside the profile keeps SQLite's -journal/-wal files paired with their DB.
+function copyProfile(from, to, id) {
+  const json = path.join(from, "profiles", `${id}.json`);
+  if (!fs.existsSync(json)) throw new Error(`profile ${id} not found in ${from}`);
+  fs.mkdirSync(path.join(to, "profiles"), { recursive: true });
+  fs.copyFileSync(json, path.join(to, "profiles", `${id}.json`));
+  const ud = path.join(from, "user-data", id), dstUd = path.join(to, "user-data", id);
+  if (fs.existsSync(ud)) rsync(ud, dstUd, ["--delete"]);
+  // Never launched on the source side: no cookies to pair with the JSON.
+  else fs.rmSync(dstUd, { recursive: true, force: true });
+}
+
+// Never deletes a profile from the backup: a full push from a fresh machine
+// must not wipe what other machines stored.
 export function push(name, profileId) {
-  const dst = resolveTarget(name);
   const root = dataRoot();
-  guardRunning(profileId ? [profileId] : undefined);
-  if (profileId) {
-    copyFiles(path.join(root, "profiles"), path.join(dst, "profiles"), [`${profileId}.json`]);
-    const ud = path.join(root, "user-data", profileId);
-    if (fs.existsSync(ud)) rsync(ud, path.join(dst, "user-data", profileId), ["--delete"]);
-  } else {
-    // Full push mirrors: a profile deleted locally disappears from the target too.
-    for (const d of DATA_DIRS) {
-      if (fs.existsSync(path.join(root, d))) rsync(path.join(root, d), path.join(dst, d), ["--delete"]);
-    }
+  const ids = profileId ? [profileId] : idsIn(root);
+  checkIds(ids);
+  guardRunning(ids);
+  const dst = resolveTarget(name, false);
+  for (const id of ids) copyProfile(root, dst, id);
+  if (!profileId) {
+    if (fs.existsSync(path.join(root, "extensions"))) rsync(path.join(root, "extensions"), path.join(dst, "extensions"));
     copyFiles(CONFIG_ROOT, path.join(dst, "config"), CONFIG_FILES);
   }
   fs.writeFileSync(path.join(dst, "LAST_PUSH.json"), JSON.stringify({ at: new Date().toISOString(), host: os.hostname(), profile: profileId || "all" }));
-  return { target: name, dir: dst, profile: profileId || "all", size: du(dst) };
+  return { target: name, dir: dst, profiles: ids.length, size: du(dst) };
 }
 
+// Replaces each restored profile wholesale and keeps profiles that exist only
+// here. A full pull also brings the config (see copyFiles).
 export function pull(name, profileId) {
-  const src = resolveTarget(name);
+  const src = resolveTarget(name, true);
+  const ids = profileId ? [profileId] : idsIn(src);
+  checkIds(ids);
+  guardRunning(ids);
   const root = dataRoot();
-  guardRunning(profileId ? [profileId] : undefined);
-  if (profileId) {
-    if (!fs.existsSync(path.join(src, "profiles", `${profileId}.json`))) throw new Error(`profile ${profileId} not in ${src}`);
-    copyFiles(path.join(src, "profiles"), path.join(root, "profiles"), [`${profileId}.json`]);
-    const ud = path.join(src, "user-data", profileId);
-    if (fs.existsSync(ud)) rsync(ud, path.join(root, "user-data", profileId), ["--delete"]);
-  } else {
-    // Full pull merges: local-only profiles are kept.
-    for (const d of DATA_DIRS) {
-      if (fs.existsSync(path.join(src, d))) rsync(path.join(src, d), path.join(root, d));
-    }
+  for (const id of ids) copyProfile(src, root, id);
+  if (!profileId) {
+    if (fs.existsSync(path.join(src, "extensions"))) rsync(path.join(src, "extensions"), path.join(root, "extensions"));
     copyFiles(path.join(src, "config"), CONFIG_ROOT, CONFIG_FILES);
   }
-  return { target: name, dir: src, profile: profileId || "all", note: "restart the launcher if new profiles or proxies do not show up" };
+  return { target: name, dir: src, profiles: ids.length, note: "restart the launcher if new proxies do not show up" };
 }
 
 export function status() {
   const t = targets();
   const remote = Object.fromEntries(
     Object.entries(t).map(([n, d]) => {
-      const profiles = d && fs.existsSync(path.join(d, "profiles"))
-        ? fs.readdirSync(path.join(d, "profiles")).filter((f) => f.endsWith(".json")).map((f) => f.slice(0, -5))
-        : [];
-      return [n, { dir: d, reachable: !!d && fs.existsSync(path.dirname(d)), profiles, last_push: d ? readJson(path.join(d, "LAST_PUSH.json"), null) : null }];
+      const profiles = d ? idsIn(d).map((id) => ({ id, name: readJson(path.join(d, "profiles", `${id}.json`), {}).name || "" })) : [];
+      const parent = d && path.dirname(d);
+      const reachable = !!d && (fs.existsSync(d) || (fs.existsSync(parent) && !MOUNT_ROOTS.includes(parent)));
+      return [n, { dir: d, reachable, profiles, last_push: d ? readJson(path.join(d, "LAST_PUSH.json"), null) : null }];
     }),
   );
   return { data_root: dataRoot(), running: running(path.join(dataRoot(), "user-data")), targets: remote };
 }
 
 // ---------- CLI ----------
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {
   const [cmd, a, b] = process.argv.slice(2);
   try {
     const out = cmd === "push" ? push(a, b) : cmd === "pull" ? pull(a, b) : cmd === "set" ? setTarget(a, b) : status();

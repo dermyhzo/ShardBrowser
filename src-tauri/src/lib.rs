@@ -26,6 +26,7 @@ mod modguard;
 mod runner;
 mod wasm;
 mod trash;
+mod cloud_sync;
 
 use serde_json::Value;
 
@@ -77,6 +78,34 @@ async fn mcp_download(dir: String) -> Result<String, String> {
     mcp_setup::download_mcp(std::path::Path::new(&dir))
         .await
         .map(|p| p.display().to_string())
+        .map_err(|e| e.to_string())
+}
+
+// ---- Cloud sync (NAS / Google Drive) ----
+
+#[tauri::command]
+fn cloud_sync_status() -> Vec<cloud_sync::TargetStatus> {
+    cloud_sync::status()
+}
+
+#[tauri::command]
+fn cloud_sync_set_target(target: String, dir: String) -> Result<(), String> {
+    cloud_sync::set_target(&target, &dir).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cloud_sync_push(target: String, ids: Option<Vec<String>>) -> Result<cloud_sync::SyncResult, String> {
+    tauri::async_runtime::spawn_blocking(move || cloud_sync::push(&target, ids))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cloud_sync_pull(target: String, ids: Option<Vec<String>>) -> Result<cloud_sync::SyncResult, String> {
+    tauri::async_runtime::spawn_blocking(move || cloud_sync::pull(&target, ids))
+        .await
+        .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
 }
 
@@ -2176,6 +2205,10 @@ pub fn run() {
             bookmark_save,
             bookmark_delete,
             data_root_get,
+            cloud_sync_status,
+            cloud_sync_set_target,
+            cloud_sync_push,
+            cloud_sync_pull,
             data_root_migrate,
             profile_bind_proxy,
             profile_clone,

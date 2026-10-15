@@ -61,3 +61,21 @@ export type ApiInfo = {
   base_url: string;
   token: string;
 };
+
+export interface CloudSyncTarget {
+  name: "nas" | "gdrive";
+  dir: string | null;
+  /** Folder chosen by the user rather than detected. */
+  custom: boolean;
+  /** Parent folder exists: share mounted / Drive running. */
+  reachable: boolean;
+  profiles: { id: string; name: string }[];
+  last_push: { at: string; host: string } | null;
+}
+
+export interface CloudSyncResult {
+  target: string;
+  dir: string;
+  profiles: number;
+  files_copied: number;
+}
