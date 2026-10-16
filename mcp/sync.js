@@ -298,8 +298,13 @@ function remoteAhead(dir, id) {
   const st = remoteState(dir, id), local = getLocal(dir, id);
   if (st) return st.rev > local.rev;
   const rud = path.join(dir, "user-data", id), lud = path.join(dataRoot(), "user-data", id);
-  if (!Object.keys(scan(rud)).length || local.fp) return false;
-  return fingerprint(lud) !== fingerprint(rud);
+  const r = scan(rud), l = scan(lud);
+  if (!Object.keys(r).length || local.fp) return false;
+  if (!Object.keys(l).length) return true;
+  if (fingerprint(lud) === fingerprint(rud)) return false;
+  // Old-style copy, no history: recency decides.
+  const newest = (m) => Math.max(0, ...Object.values(m).map(([, mt]) => mt));
+  return newest(r) > newest(l);
 }
 function publish(dst, id) {
   const root = dataRoot();

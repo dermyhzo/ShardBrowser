@@ -873,9 +873,14 @@ fn adopt(dir: &Path, id: &str) -> Result<u64> {
     Ok(n)
 }
 
+fn newest_mtime(dir: &Path) -> u64 {
+    scan(dir).values().map(|(_, mt)| *mt).max().unwrap_or(0)
+}
+
 /// Remote is ahead of what this machine last synced. An old-style copy (no
-/// state file) that this machine never synced counts as ahead, unless it is
-/// byte-for-byte what is here, in which case the two are adopted as in sync.
+/// state file, e.g. a manual backup made before auto sync) carries no history,
+/// so recency decides: it is ahead only when its newest file is newer than
+/// anything here. An identical copy is adopted as in sync.
 fn remote_ahead(dir: &Path, id: &str, st: Option<&RemoteState>, local: &LocalEntry) -> bool {
     if st.is_none() && state_unreadable(dir, id) {
         return true;
@@ -888,11 +893,14 @@ fn remote_ahead(dir: &Path, id: &str, st: Option<&RemoteState>, local: &LocalEnt
                 return false;
             }
             let lud = store::data_root().map(|r| r.join("user-data").join(id)).unwrap_or_default();
-            let same = has_files(&lud) && fingerprint(&lud) == fingerprint(&rud);
-            if same {
-                let _ = set_local(dir, id, LocalEntry { rev: 0, dirty: false, fp: fingerprint(&lud) });
+            if !has_files(&lud) {
+                return true; // nothing here: the backup is all there is
             }
-            !same
+            if fingerprint(&lud) == fingerprint(&rud) {
+                let _ = set_local(dir, id, LocalEntry { rev: 0, dirty: false, fp: fingerprint(&lud) });
+                return false;
+            }
+            newest_mtime(&rud) > newest_mtime(&lud)
         }
     }
 }
@@ -946,7 +954,9 @@ pub fn before_launch(id: &str) -> Result<()> {
     let mut st = remote_state(&dir, id);
     // A copy with no state file is an old-style backup, or Drive delivered the
     // files before state/<id>.json: give the state a moment to land.
-    if st.is_none() && has_files(&rud) && local.fp.is_empty() {
+    // Only worth waiting when that copy would win (newer than this one); an
+    // older manual backup has no state coming and must not delay Start.
+    if st.is_none() && has_files(&rud) && local.fp.is_empty() && newest_mtime(&rud) > newest_mtime(&lud) {
         let t0 = std::time::Instant::now();
         while st.is_none() && t0.elapsed().as_secs() < STATE_GRACE_SECS {
             std::thread::sleep(std::time::Duration::from_secs(2));
@@ -1559,6 +1569,31 @@ mod tests {
         reconcile().unwrap();
         assert!(data.join("profiles").join(format!("{ID}.json")).exists());
         assert!(!share.join("trash").join(ID).exists());
+    }
+
+    #[test]
+    fn an_older_old_style_backup_does_not_block_the_newer_profile_here() {
+        let (_g, data, share) = sandbox();
+        profile(&share, Some("OLD-BACKUP"));
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        fs::File::options().write(true).open(share.join("user-data").join(ID).join("Default/Cookies")).unwrap().set_modified(old).unwrap();
+        profile(&data, Some("USED-SINCE, NEWER"));
+        before_launch(ID).unwrap();
+        assert_eq!(cookies(&data).as_deref(), Some("USED-SINCE, NEWER"), "local must win");
+        crate::cloud_sync::abort_launch(ID);
+        after_exit(ID);
+        assert_eq!(cookies(&share).as_deref(), Some("USED-SINCE, NEWER"), "close uploads the newer copy");
+        assert_eq!(remote_state(&share, ID).unwrap().rev, 1);
+    }
+
+    #[test]
+    fn a_newer_old_style_backup_still_conflicts_with_a_changed_profile_here() {
+        let (_g, data, share) = sandbox();
+        profile(&data, Some("LOCAL"));
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        fs::File::options().write(true).open(data.join("user-data").join(ID).join("Default/Cookies")).unwrap().set_modified(old).unwrap();
+        profile(&share, Some("NEWER-ELSEWHERE"));
+        assert!(before_launch(ID).unwrap_err().to_string().contains("changed both"));
     }
 
     #[test]
