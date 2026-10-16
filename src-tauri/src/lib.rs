@@ -1389,6 +1389,8 @@ fn read_text_file(path: String) -> Result<String, String> {
 
 #[tauri::command]
 fn process_list() -> Vec<process::RunningProfile> {
+    // Browsers left running by a previous launcher show up as running here.
+    process::Tracker::shared().adopt_orphans();
     process::Tracker::shared().running()
 }
 
@@ -2315,6 +2317,7 @@ pub fn run() {
         ])
         .setup(|app| {
             let _ = APP_HANDLE.set(app.handle().clone());
+            process::Tracker::shared().adopt_orphans();
             cloud_sync::spawn_reconciler();
 
             {

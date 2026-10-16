@@ -64,6 +64,11 @@ pub async fn launch_profile_synced(
     if Tracker::shared().is_running(profile_id) {
         anyhow::bail!("profile {profile_id} is already running");
     }
+    // Already running under a previous launcher: take it over instead of
+    // starting a second browser that would only hand off and exit.
+    if let Some(pid) = Tracker::shared().adopt_if_orphan(profile_id) {
+        return Ok(LaunchOutcome { pid, cdp: Tracker::shared().cdp(profile_id), cdp_error: None });
+    }
     // Auto sync: pull the newest copy and take the profile's lock first, and
     // give the lock back if the launch then fails.
     {

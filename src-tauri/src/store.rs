@@ -9,13 +9,15 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
 
 pub fn config_root() -> Result<PathBuf> {
-    // Tests point the config at a temp dir instead of the user's real one.
+    // Tests never touch the user's real config: the whole test process uses
+    // one temp dir from the first call on.
     #[cfg(test)]
-    if let Ok(p) = std::env::var("SHARDX_TEST_CONFIG") {
-        let p = PathBuf::from(p);
+    {
+        let p = std::env::temp_dir().join(format!("shardx-test-config-{}", std::process::id()));
         std::fs::create_dir_all(&p)?;
         return Ok(p);
     }
+    #[allow(unreachable_code)]
     let base = dirs::config_dir().context("OS config dir unavailable")?;
     let root = base.join("shardx-launcher");
     std::fs::create_dir_all(&root)?;

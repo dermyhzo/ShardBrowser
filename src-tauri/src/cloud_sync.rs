@@ -981,8 +981,13 @@ pub fn before_launch(id: &str) -> Result<()> {
         eprintln!("[sync] pulled {id} from {host}");
     }
     take_lock(&dir, id)?;
-    // Heartbeat: keeps the lock fresh while the browser runs; after_exit and
-    // abort_launch flip the flag before they release, so it cannot come back.
+    start_heartbeat(dir, id);
+    Ok(())
+}
+
+/// Keeps the lock fresh while the browser runs; after_exit and abort_launch
+/// flip the flag before they release, so it cannot come back.
+fn start_heartbeat(dir: PathBuf, id: &str) {
     let stop = heartbeat_flag(id, true);
     let id = id.to_string();
     std::thread::spawn(move || loop {
@@ -994,7 +999,19 @@ pub fn before_launch(id: &str) -> Result<()> {
             let _ = take_lock(&dir, &id);
         }
     });
-    Ok(())
+}
+
+/// A browser adopted from a previous launcher: its heartbeat died with that
+/// launcher. Re-take the lock unless another machine holds it now, and keep it
+/// fresh again.
+pub fn resume_heartbeat(id: &str) {
+    let Some(dir) = auto_target().and_then(|t| resolve(&t, false).ok()) else { return };
+    if !valid_id(id) || is_temporary(id) || foreign_lock(&dir, id).is_some() {
+        return;
+    }
+    if take_lock(&dir, id).is_ok() {
+        start_heartbeat(dir, id);
+    }
 }
 
 /// The launch failed after before_launch took the lock: give it back.
@@ -1355,15 +1372,20 @@ mod tests {
     /// auto sync on a temp "nas" folder. The mutex keeps them from overlapping.
     fn sandbox() -> (std::sync::MutexGuard<'static, ()>, PathBuf, PathBuf) {
         static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let g = M.lock().unwrap_or_else(|e| e.into_inner());
-        let base = std::env::temp_dir().join(format!("shardx-auto-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        let (cfg, data, share) = (base.join("config"), base.join("data"), base.join("share/ShardX-Sync"));
-        for d in [&cfg, &data, &share] {
+        // A fresh data root and share per test; nothing shared gets deleted.
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let base = std::env::temp_dir().join(format!("shardx-auto-{}-{n}", std::process::id()));
+        let (data, share) = (base.join("data"), base.join("share/ShardX-Sync"));
+        for d in [&data, &share] {
             fs::create_dir_all(d).unwrap();
         }
-        std::env::set_var("SHARDX_TEST_CONFIG", &cfg);
         store::set_data_root(Some(data.clone()));
+        let cfg = store::config_root().unwrap();
+        for f in ["sync-state.json", "sync-pending.json"] {
+            let _ = fs::remove_file(cfg.join(f));
+        }
         fs::write(cfg.join("sync.json"), serde_json::json!({ "nas": share, "auto": "nas" }).to_string()).unwrap();
         (g, data, share)
     }
